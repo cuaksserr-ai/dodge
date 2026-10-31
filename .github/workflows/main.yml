@@ -1,0 +1,462 @@
+# Satu file berisi SEMUA: kode game (C), manifest, dan skrip build.
+# Simpan di repository GitHub dengan jalur: .github/workflows/build-apk.yml
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tulis berkas sumber
+        run: |
+          mkdir -p dodge
+          cd dodge
+          cat > main.c <<'DODGE_EOF'
+          /*
+           * DODGE - game Android 100% bahasa C
+           * ----------------------------------
+           * Satu file, satu bahasa: tidak ada Java/Kotlin dan tidak butuh OpenGL.
+           * Android memuat libgame.so lewat NativeActivity, lalu kita menggambar
+           * piksel langsung ke jendela (ANativeWindow) dengan render software.
+           *
+           * Cara main : geser jari kiri/kanan, hindari balok merah yang jatuh.
+           * Jeda      : otomatis saat aplikasi ke latar belakang / kehilangan fokus.
+           * Rekor     : disimpan di penyimpanan internal aplikasi (best.dat).
+           */
+          #include <android/input.h>
+          #include <android/log.h>
+          #include <android/looper.h>
+          #include <android/native_window.h>
+          #include <android_native_app_glue.h>
+          #include <math.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "dodge", __VA_ARGS__)
+          #define LW 360 /* lebar layar logika; tingginya mengikuti rasio layar HP */
+          #define RGB(r, g, b) (0xFF000000u | ((uint32_t)(b) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(r))
+          #define NOBS 32
+          #define NPART 128
+          #define NSTAR 48
+
+          enum { MENU, PLAY, PAUSED, OVER };
+
+          typedef struct { float x, y, w, h; int on; } Obs;
+          typedef struct { float x, y, vx, vy, life; uint32_t col; } Part;
+          typedef struct { float x, y, v; } Star;
+
+          /* ------------------------------------------------------------ state ---- */
+          static struct android_app *app;
+          static int have_window, resumed, surf_w, surf_h;
+          static int W = LW, H;                      /* ukuran layar logika */
+          static int state = MENU, score, best, newbest;
+          static float px, py, target_x;             /* posisi pemain & arah jari */
+          static float t_play, spawn_t, lock_t, shake, blink;
+          static int touching, tapped;
+          static double last_t;
+          static char save_path[600];
+          static Obs obs[NOBS];
+          static Part parts[NPART];
+          static Star stars[NSTAR];
+
+          static uint32_t *pix;                      /* buffer frame yang sedang digambar */
+          static int stride, cw, ch, shx, shy;
+
+          /* ---------------------------------------------------------- utilitas ---- */
+          static double now_s(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+          }
+          static float rnd(float a, float b) { return a + (b - a) * ((float)rand() / (float)RAND_MAX); }
+          static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+          static uint32_t shade(uint32_t c, float f) {
+              f = clampf(f, 0.f, 1.f);
+              return RGB((int)((c & 255) * f), (int)(((c >> 8) & 255) * f), (int)(((c >> 16) & 255) * f));
+          }
+
+          static void load_best(void) {
+              FILE *f = fopen(save_path, "rb");
+              if (!f) return;
+              if (fread(&best, sizeof best, 1, f) != 1 || best < 0) best = 0;
+              fclose(f);
+          }
+          static void save_best(void) {
+              FILE *f = fopen(save_path, "wb");
+              if (!f) return;
+              fwrite(&best, sizeof best, 1, f);
+              fclose(f);
+          }
+
+          /* ------------------------------------------------------------ gambar ---- */
+          static void rect(int x, int y, int w, int h, uint32_t c) {
+              x += shx;
+              y += shy;
+              int x1 = x + w, y1 = y + h;
+              if (x < 0) x = 0;
+              if (y < 0) y = 0;
+              if (x1 > cw) x1 = cw;
+              if (y1 > ch) y1 = ch;
+              for (int j = y; j < y1; j++) {
+                  uint32_t *row = pix + (size_t)j * stride;
+                  for (int i = x; i < x1; i++) row[i] = c;
+              }
+          }
+
+          /* Font piksel 3x5: urutan 0-9 lalu A-Z, tiap huruf = 5 baris x 3 kolom. */
+          static const char *FONT[36] = {
+              "111" "101" "101" "101" "111", /* 0 */
+              "010" "110" "010" "010" "111", /* 1 */
+              "111" "001" "111" "100" "111", /* 2 */
+              "111" "001" "111" "001" "111", /* 3 */
+              "101" "101" "111" "001" "001", /* 4 */
+              "111" "100" "111" "001" "111", /* 5 */
+              "111" "100" "111" "101" "111", /* 6 */
+              "111" "001" "001" "010" "010", /* 7 */
+              "111" "101" "111" "101" "111", /* 8 */
+              "111" "101" "111" "001" "111", /* 9 */
+              "010" "101" "111" "101" "101", /* A */
+              "110" "101" "110" "101" "110", /* B */
+              "011" "100" "100" "100" "011", /* C */
+              "110" "101" "101" "101" "110", /* D */
+              "111" "100" "110" "100" "111", /* E */
+              "111" "100" "110" "100" "100", /* F */
+              "011" "100" "101" "101" "011", /* G */
+              "101" "101" "111" "101" "101", /* H */
+              "111" "010" "010" "010" "111", /* I */
+              "001" "001" "001" "101" "010", /* J */
+              "101" "101" "110" "101" "101", /* K */
+              "100" "100" "100" "100" "111", /* L */
+              "101" "111" "111" "101" "101", /* M */
+              "110" "101" "101" "101" "101", /* N */
+              "111" "101" "101" "101" "111", /* O */
+              "111" "101" "111" "100" "100", /* P */
+              "111" "101" "101" "111" "001", /* Q */
+              "110" "101" "110" "101" "101", /* R */
+              "011" "100" "010" "001" "110", /* S */
+              "111" "010" "010" "010" "010", /* T */
+              "101" "101" "101" "101" "111", /* U */
+              "101" "101" "101" "101" "010", /* V */
+              "101" "101" "111" "111" "101", /* W */
+              "101" "101" "010" "101" "101", /* X */
+              "101" "101" "010" "010" "010", /* Y */
+              "111" "001" "010" "100" "111", /* Z */
+          };
+
+          static void glyph(char c, int x, int y, int s, uint32_t col) {
+              const char *g = NULL;
+              if (c >= '0' && c <= '9') g = FONT[c - '0'];
+              else if (c >= 'A' && c <= 'Z') g = FONT[10 + c - 'A'];
+              else if (c == '!') g = "010" "010" "010" "000" "010";
+              if (!g) return; /* spasi & karakter lain: kosong */
+              for (int i = 0; i < 15; i++)
+                  if (g[i] == '1') rect(x + (i % 3) * s, y + (i / 3) * s, s, s, col);
+          }
+          static int text_w(const char *t, int s) { return (int)strlen(t) * 4 * s - s; }
+          static void text(const char *t, int x, int y, int s, uint32_t col) {
+              for (; *t; t++, x += 4 * s) glyph(*t, x, y, s, col);
+          }
+          static void text_c(const char *t, int y, int s, uint32_t col) {
+              text(t, (W - text_w(t, s)) / 2, y, s, col);
+          }
+          static void panel(int y, int h) {
+              int x = (W - 270) / 2;
+              rect(x - 2, y - 2, 274, h + 4, RGB(80, 220, 255));
+              rect(x, y, 270, h, RGB(12, 12, 36));
+          }
+
+          /* -------------------------------------------------------------- game ---- */
+          static void layout(void) {
+              py = H * 0.82f;
+              px = target_x = W / 2.0f;
+          }
+          static void stars_init(void) {
+              for (int i = 0; i < NSTAR; i++) stars[i] = (Star){rnd(0, W), rnd(0, H), rnd(15, 90)};
+          }
+          static void emit(float x, float y, float vx, float vy, float life, uint32_t col) {
+              for (int i = 0; i < NPART; i++)
+                  if (parts[i].life <= 0) {
+                      parts[i] = (Part){x, y, vx, vy, life, col};
+                      return;
+                  }
+          }
+          static void burst(float x, float y, int n, float spd, uint32_t col) {
+              for (int i = 0; i < n; i++) {
+                  float a = rnd(0, 6.2831853f), s = rnd(0.2f, 1.f) * spd;
+                  emit(x, y, cosf(a) * s, sinf(a) * s, rnd(0.3f, 0.9f), col);
+              }
+          }
+          static void spawn(void) {
+              for (int i = 0; i < NOBS; i++)
+                  if (!obs[i].on) {
+                      float w = rnd(26, 84);
+                      obs[i] = (Obs){rnd(0, W - w), -24, w, rnd(14, 22), 1};
+                      return;
+                  }
+          }
+          static void start_game(void) {
+              memset(obs, 0, sizeof obs);
+              score = 0;
+              newbest = 0;
+              t_play = 0;
+              spawn_t = 0.6f;
+              state = PLAY;
+          }
+          static void end_game(void) {
+              state = OVER;
+              lock_t = 0.7f; /* jeda singkat supaya tidak langsung ter-restart */
+              shake = 0.35f;
+              burst(px, py, 40, 260.f, RGB(255, 190, 60));
+              burst(px, py, 24, 180.f, RGB(90, 220, 255));
+              if (score > best) {
+                  best = score;
+                  newbest = 1;
+                  save_best();
+              }
+          }
+
+          static void play(float dt) {
+              t_play += dt;
+              float speed = fminf(160.f + 7.f * t_play, 500.f);       /* makin lama makin cepat */
+              float gap = fmaxf(0.28f, 0.85f - 0.011f * t_play);      /* dan makin rapat */
+
+              if (touching) px += (target_x - px) * fminf(1.f, dt * 25.f);
+              px = clampf(px, 18.f, W - 18.f);
+
+              spawn_t -= dt;
+              if (spawn_t <= 0) {
+                  spawn_t += gap;
+                  spawn();
+                  if (t_play > 20.f && rand() % 4 == 0) spawn(); /* kadang dobel */
+              }
+
+              /* jejak api mesin */
+              emit(px + rnd(-5, 5), py + 10, rnd(-12, 12), rnd(90, 170), rnd(0.15f, 0.35f), RGB(255, 150, 50));
+
+              for (int i = 0; i < NOBS; i++) {
+                  Obs *o = &obs[i];
+                  if (!o->on) continue;
+                  o->y += speed * dt;
+                  if (o->y > H) {
+                      o->on = 0;
+                      score++;
+                      continue;
+                  }
+                  if (o->x < px + 15 && o->x + o->w > px - 15 && o->y < py + 10 && o->y + o->h > py - 10) {
+                      end_game();
+                      return;
+                  }
+              }
+          }
+
+          static void update(float dt) {
+              for (int i = 0; i < NSTAR; i++) {
+                  stars[i].y += stars[i].v * dt;
+                  if (stars[i].y > H) {
+                      stars[i].y = 0;
+                      stars[i].x = rnd(0, W);
+                  }
+              }
+              for (int i = 0; i < NPART; i++) {
+                  Part *p = &parts[i];
+                  if (p->life <= 0) continue;
+                  p->x += p->vx * dt;
+                  p->y += p->vy * dt;
+                  p->life -= dt;
+              }
+              if (shake > 0) shake -= dt;
+
+              switch (state) {
+              case MENU:   if (tapped) start_game(); break;
+              case PAUSED: if (tapped) state = PLAY; break;
+              case OVER:   lock_t -= dt; if (tapped && lock_t <= 0) start_game(); break;
+              case PLAY:   play(dt); break;
+              }
+              tapped = 0;
+          }
+
+          static void render(uint32_t *bits, int strd, int bw, int bh) {
+              pix = bits;
+              stride = strd;
+              cw = bw < W ? bw : W;
+              ch = bh < H ? bh : H;
+
+              /* latar gradasi */
+              for (int y = 0; y < ch; y++) {
+                  float f = (float)y / (float)ch;
+                  uint32_t c = RGB((int)(8 + 22 * f), (int)(8 + 8 * f), (int)(30 + 40 * f));
+                  uint32_t *row = pix + (size_t)y * stride;
+                  for (int x = 0; x < cw; x++) row[x] = c;
+              }
+
+              int a = (int)(shake * 24.f); /* getar layar saat tabrakan */
+              shx = a > 0 ? rand() % (2 * a + 1) - a : 0;
+              shy = a > 0 ? rand() % (2 * a + 1) - a : 0;
+
+              for (int i = 0; i < NSTAR; i++) {
+                  int b = 70 + (int)(stars[i].v * 1.8f);
+                  int s = stars[i].v > 60 ? 2 : 1;
+                  rect((int)stars[i].x, (int)stars[i].y, s, s, RGB(b, b, 255));
+              }
+              for (int i = 0; i < NOBS; i++) {
+                  if (!obs[i].on) continue;
+                  int x = (int)obs[i].x, y = (int)obs[i].y, w = (int)obs[i].w, h = (int)obs[i].h;
+                  rect(x, y, w, h, RGB(220, 60, 80));
+                  rect(x, y, w, 3, RGB(255, 130, 140));
+                  rect(x, y + h - 3, w, 3, RGB(150, 30, 55));
+              }
+              if (state != OVER) { /* pesawat pemain */
+                  int x = (int)px, y = (int)py;
+                  rect(x - 16, y - 2, 32, 12, RGB(60, 200, 255));
+                  rect(x - 16, y + 7, 32, 3, RGB(30, 130, 200));
+                  rect(x - 8, y - 9, 16, 8, RGB(130, 230, 255));
+                  rect(x - 3, y - 14, 6, 6, RGB(255, 255, 255));
+              }
+              for (int i = 0; i < NPART; i++) {
+                  Part *p = &parts[i];
+                  if (p->life > 0) rect((int)p->x, (int)p->y, 3, 3, shade(p->col, p->life * 4.f));
+              }
+
+              /* antarmuka */
+              char buf[48];
+              int cy = H / 2, on = fmodf(blink, 1.f) < 0.65f;
+              uint32_t white = RGB(255, 255, 255), gold = RGB(255, 220, 60);
+
+              if (state == PLAY || state == PAUSED) {
+                  snprintf(buf, sizeof buf, "%d", score);
+                  text_c(buf, 36, 4, white);
+              }
+              if (state == MENU) {
+                  text_c("DODGE", H / 5 + 4, 10, RGB(20, 70, 110));
+                  text_c("DODGE", H / 5, 10, RGB(80, 220, 255));
+                  text_c("GESER JARI UNTUK GERAK", H / 5 + 76, 2, RGB(190, 190, 220));
+                  if (best > 0) {
+                      snprintf(buf, sizeof buf, "REKOR %d", best);
+                      text_c(buf, cy + 10, 3, gold);
+                  }
+                  if (on) text_c("KETUK UNTUK MAIN", cy + 56, 3, white);
+              } else if (state == PAUSED) {
+                  panel(cy - 50, 100);
+                  text_c("JEDA", cy - 36, 6, RGB(80, 220, 255));
+                  if (on) text_c("KETUK UNTUK LANJUT", cy + 20, 3, white);
+              } else if (state == OVER) {
+                  int y0 = cy - 100;
+                  panel(y0, 200);
+                  text_c("GAME OVER", y0 + 18, 6, RGB(255, 90, 100));
+                  snprintf(buf, sizeof buf, "SKOR %d", score);
+                  text_c(buf, y0 + 72, 4, white);
+                  if (newbest) {
+                      text_c("REKOR BARU!", y0 + 112, 3, gold);
+                  } else {
+                      snprintf(buf, sizeof buf, "REKOR %d", best);
+                      text_c(buf, y0 + 112, 3, gold);
+                  }
+                  if (lock_t <= 0 && on) text_c("KETUK UNTUK ULANG", y0 + 160, 3, white);
+              }
+          }
+
+          static void frame(void) {
+              double t = now_s();
+              float dt = (float)(t - last_t);
+              last_t = t;
+              dt = clampf(dt, 0.f, 0.05f); /* cegah lompatan besar saat lag */
+              blink += dt;
+              update(dt);
+
+              ANativeWindow_Buffer b;
+              if (ANativeWindow_lock(app->window, &b, NULL) < 0) return;
+              if (b.format == WINDOW_FORMAT_RGBA_8888 || b.format == WINDOW_FORMAT_RGBX_8888)
+                  render((uint32_t *)b.bits, b.stride, b.width, b.height);
+              ANativeWindow_unlockAndPost(app->window);
+          }
+
+          /* ------------------------------------------------------------ Android ---- */
+          static void on_cmd(struct android_app *a, int32_t cmd) {
+              switch (cmd) {
+              case APP_CMD_INIT_WINDOW: {
+                  if (!a->window) break;
+                  surf_w = ANativeWindow_getWidth(a->window);
+                  surf_h = ANativeWindow_getHeight(a->window);
+                  if (surf_w <= 0 || surf_h <= 0) break;
+                  /* buffer berukuran tetap (360 lebar); layar yang menskalakan ke ukuran asli */
+                  int nh = (int)((float)LW * (float)surf_h / (float)surf_w + 0.5f);
+                  ANativeWindow_setBuffersGeometry(a->window, LW, nh, WINDOW_FORMAT_RGBA_8888);
+                  if (nh != H) {
+                      H = nh;
+                      layout();
+                      stars_init();
+                      state = MENU;
+                      memset(obs, 0, sizeof obs);
+                  }
+                  have_window = 1;
+                  last_t = now_s();
+                  LOG("layar %dx%d -> logika %dx%d", surf_w, surf_h, W, H);
+                  break;
+              }
+              case APP_CMD_TERM_WINDOW:
+                  have_window = 0;
+                  break;
+              case APP_CMD_RESUME:
+                  resumed = 1;
+                  last_t = now_s();
+                  break;
+              case APP_CMD_GAINED_FOCUS:
+                  last_t = now_s();
+                  break;
+              case APP_CMD_PAUSE:
+                  resumed = 0;
+                  /* fallthrough */
+              case APP_CMD_LOST_FOCUS:
+                  touching = 0;
+                  if (state == PLAY) state = PAUSED;
+                  break;
+              }
+          }
+
+          static int32_t on_input(struct android_app *a, AInputEvent *e) {
+              (void)a;
+              if (AInputEvent_getType(e) != AINPUT_EVENT_TYPE_MOTION || surf_w <= 0) return 0;
+              int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK;
+              float x = AMotionEvent_getX(e, 0) * (float)W / (float)surf_w;
+              if (act == AMOTION_EVENT_ACTION_DOWN) {
+                  touching = 1;
+                  tapped = 1;
+                  target_x = x;
+              } else if (act == AMOTION_EVENT_ACTION_MOVE) {
+                  target_x = x;
+              } else if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) {
+                  touching = 0;
+              }
+              return 1;
+          }
+
+          void android_main(struct android_app *a) {
+              app = a;
+              a->onAppCmd = on_cmd;
+              a->onInputEvent = on_input;
+
+              /* proses bisa hidup lebih lama dari activity, jadi reset semuanya di sini */
+              have_window = resumed = touching = tapped = 0;
+              state = MENU;
+              H = 0;
+              score = newbest = 0;
+              shake = blink = 0;
+              memset(obs, 0, sizeof obs);
+              memset(parts, 0, sizeof parts);
+              srand((unsigned)time(NULL));
+              snprintf(save_path, sizeof save_path, "%s/best.dat", a->activity->internalDataPath);
+              load_best();
+
+              for (;;) {
+                  int events;
+                  struct android_poll_source *src = NULL;
+                  /* aktif: jangan menunggu (gambar terus); tidak aktif: tidur sampai ada event */
+                  while (ALooper_pollOnce((have_window && resumed) ? 0 : -1, NULL, &events, (void **)&src) >= 0) {
+                      if (src) src->process(a, src);
+                      if (a->destroyRequested) return;
+                      src = NULL;
+                  }
+                  if (a->destroyRequested) return;
+     
